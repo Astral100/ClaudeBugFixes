@@ -65,6 +65,6 @@ The scripts only mark; deletion stays manual. Removing a row for good needs BOTH
 
 ## Related upstream issues (anthropics/claude-code)
 
-- Fork on background/resume: #82489, #86092, #76493, #85004, #78264, #72012
-- Title-only stubs: #85404 (closed as completed; stubs on v2.1.235 look like a regression), #77898, #85875, #82969
-- Ghost "no saved transcript" rows: #81662, #79757
+- Fork on background/resume: [#82489](https://github.com/anthropics/claude-code/issues/82489), [#86092](https://github.com/anthropics/claude-code/issues/86092), [#76493](https://github.com/anthropics/claude-code/issues/76493), [#85004](https://github.com/anthropics/claude-code/issues/85004), [#78264](https://github.com/anthropics/claude-code/issues/78264), [#72012](https://github.com/anthropics/claude-code/issues/72012)
+- Title-only stubs: [#85404](https://github.com/anthropics/claude-code/issues/85404) (closed as completed; stubs on v2.1.235 look like a regression), [#77898](https://github.com/anthropics/claude-code/issues/77898), [#85875](https://github.com/anthropics/claude-code/issues/85875), [#82969](https://github.com/anthropics/claude-code/issues/82969)
+- Ghost "no saved transcript" rows: [#81662](https://github.com/anthropics/claude-code/issues/81662), [#79757](https://github.com/anthropics/claude-code/issues/79757)
