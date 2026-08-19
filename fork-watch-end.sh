@@ -16,6 +16,15 @@ last=$(tac "$tpath" | grep -m1 -oE '"uuid":"[0-9a-f-]{36}"' | grep -oE '[0-9a-f-
 
 pdir=$(dirname "$tpath")
 successor=$(grep -l "\"uuid\":\"$first\"" "$pdir"/*.jsonl 2>/dev/null | grep -v -F "$tpath" | xargs -r grep -l "\"uuid\":\"$last\"" 2>/dev/null | head -1)
+if [ -z "$successor" ]; then
+  # The raw tail can be a junk entry minted in this file alone (attachment,
+  # system-reminder-only user entry, "No response requested." filler) — no
+  # successor ever holds it. Retry on the last CONVERSATION uuid.
+  rlast=$(tac "$tpath" 2>/dev/null | jq --unbuffered -Rr 'fromjson? | select(.type=="user" or .type=="assistant") | select(.uuid != null) | (.message.content | if type=="string" then . else (.[0].text // .[0].type // "") end) as $t | select(($t | startswith("<system-reminder>") | not) and ($t != "No response requested.")) | .uuid' 2>/dev/null | head -1)
+  if [ -n "$rlast" ] && [ "$rlast" != "$last" ]; then
+    successor=$(grep -l "\"uuid\":\"$first\"" "$pdir"/*.jsonl 2>/dev/null | grep -v -F "$tpath" | xargs -r grep -l "\"uuid\":\"$rlast\"" 2>/dev/null | head -1)
+  fi
+fi
 [ -n "$successor" ] || exit 0
 
 strip_markers() {

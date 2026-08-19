@@ -1,5 +1,6 @@
 #!/bin/bash
 # Fixture test for the refactored fork-watch sweeps (cache-based, --sweep-only).
+: "${TMPDIR:=/tmp}"
 T="$TMPDIR/fwtest-root"
 rm -rf "$T"
 mkdir -p "$T/.claude/projects/proj1" "$T/.claude/daemon"
@@ -55,6 +56,51 @@ printf '{"type":"ai-title","aiTitle":"[Dead]"}\n{"uuid":"%s","type":"user"}\n' "
 BT2="$P/beef0001-0000-0000-0000-000000000000.jsonl"
 printf '{"type":"ai-title","aiTitle":"[Dup]"}\n' > "$BT2"; old "$BT2"
 
+# --- fresh superseded copy: written moments before the sweep, must settle and
+# --- be marked on the FIRST pass (no recency skip) ---
+CU1="0f0f0f0f-0f0f-0f0f-0f0f-0f0f0f0f0f0f"
+CU2="f0f0f0f0-f0f0-f0f0-f0f0-f0f0f0f0f0f0"
+F3="$P/cafe0001-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"CopyC"}\n{"uuid":"%s","type":"user"}\n' "$CU1" > "$F3"
+F4="$P/cafe0002-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"CopyC"}\n{"uuid":"%s","type":"user"}\n{"uuid":"%s","type":"user"}\n' "$CU1" "$CU2" > "$F4"; old "$F4"
+
+# --- noisy superset: extra entries are junk only (reminder + filler), so the
+# --- CONVERSATIONS are identical -> twins ([Dup] on the older), not [Old Fork]
+NU1="d1d1d1d1-d1d1-d1d1-d1d1-d1d1d1d1d1d1"
+NU2="1d1d1d1d-1d1d-1d1d-1d1d-1d1d1d1d1d1d"
+NJ1="dd00dd00-dd00-dd00-dd00-dd00dd00dd00"
+NJ2="00dd00dd-00dd-00dd-00dd-00dd00dd00dd"
+NF1="$P/dada0001-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"NoisyT"}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"hello"}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}\n' "$NU1" "$NU2" > "$NF1"; old "$NF1"
+NF2="$P/dada0002-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"NoisyT"}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"hello"}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"<system-reminder> The user named this session X"}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"No response requested."}]}}\n' "$NU1" "$NU2" "$NJ1" "$NJ2" > "$NF2"; touch -m -d '1 hour ago' "$NF2"
+
+# --- reversed noisy pair: the junk superset is the OLDER twin, so IT gets the
+# --- [Dup]; its raw tail is orphaned junk, so healing must judge by the
+# --- conversation tail or every sweep would heal + re-mark it (churn)
+RU1="b2b2b2b2-b2b2-b2b2-b2b2-b2b2b2b2b2b2"
+RU2="2b2b2b2b-2b2b-2b2b-2b2b-2b2b2b2b2b2b"
+RJ1="cbcb00cb-cbcb-cbcb-cbcb-cbcb00cbcbcb"
+RN1="$P/dadb0001-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"NoisyR"}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"hey"}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"yo"}]}}\n' "$RU1" "$RU2" > "$RN1"; touch -m -d '1 hour ago' "$RN1"
+RN2="$P/dadb0002-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"NoisyR"}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"hey"}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"yo"}]}}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"<system-reminder> The user renamed this session"}}\n' "$RU1" "$RU2" "$RJ1" > "$RN2"; old "$RN2"
+
+# --- gap trio: base + junk superset + genuinely diverged sibling; BOTH stale
+# --- copies get [Old Fork], the junk superset must not slip through as an
+# --- unmarked sole twin
+GU1="c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3"
+GU2="3c3c3c3c-3c3c-3c3c-3c3c-3c3c3c3c3c3c"
+GJ1="dcdc00dc-dcdc-dcdc-dcdc-dcdc00dcdcdc"
+GU3="3d3d3d3d-3d3d-3d3d-3d3d-3d3d3d3d3d3d"
+GF="$P/eafe0001-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"GapT"}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"q"}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}\n' "$GU1" "$GU2" > "$GF"; touch -m -d '3 hours ago' "$GF"
+GG="$P/eafe0002-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"GapT"}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"q"}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"No response requested."}]}}\n' "$GU1" "$GU2" "$GJ1" > "$GG"; old "$GG"
+GH="$P/eafe0003-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"GapT"}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"q"}}\n{"uuid":"%s","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"a"}]}}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"more"}}\n' "$GU1" "$GU2" "$GU3" > "$GH"; touch -m -d '1 hour ago' "$GH"
+
 # --- jobs registry ---
 mkjob() { mkdir -p "$T/.claude/jobs/$1"; printf '{"name":"%s","sessionId":"%s"}\n' "$2" "$3" > "$T/.claude/jobs/$1/state.json"; touch -m -d '1 hour ago' "$T/.claude/jobs/$1/state.json"; }
 mkjob bbbb1111 "Global" "bbbb1111-0000-0000-0000-000000000001"   # at-rest twin, older
@@ -100,6 +146,14 @@ echo "keeper twin  (want Twin2 healed):  $(ft "$G2")"
 echo "loser twin   (want [Dup] Twin2):  $(ft "$G1")"
 echo "bare token real (want addd0001):  $(ft "$BT1")"
 echo "bare token husk (want [Stub] beef0001): $(ft "$BT2")"
+echo "fresh superseded (want [Old Fork] CopyC, marked on FIRST pass): $(ft "$F3")"
+echo "noisy superset older (want [Dup] NoisyT, junk-only extras = twins): $(ft "$NF1")"
+echo "noisy superset newer (want no custom-title): $(ft "$NF2")"
+echo "reversed noisy: junk superset older (want [Dup] NoisyR): $(ft "$RN2")"
+echo "reversed noisy: clean newer (want no custom-title): $(ft "$RN1")"
+echo "gap trio base (want [Old Fork] GapT): $(ft "$GF")"
+echo "gap trio junk superset (want [Old Fork] GapT, no unmarked slip): $(ft "$GG")"
+echo "gap trio diverged (want no custom-title): $(ft "$GH")"
 
 sum1=$(find "$T/.claude" -type f -exec md5sum {} + | sort)
 rm -f "$T/.claude/fork-watch-sweep-stamp"
@@ -107,6 +161,13 @@ run
 sum2=$(find "$T/.claude" -type f -exec md5sum {} + | sort)
 echo "--- pass 2 stability (stamp removed, full resweep) ---"
 if [ "$sum1" = "$sum2" ]; then echo "STABLE: second run changed nothing"; else echo "UNSTABLE:"; diff <(echo "$sum1") <(echo "$sum2"); fi
+
+echo "--- aged stamp: sweeps run but unchanged content is skipped ---"
+touch -m -d '40 seconds ago' "$T/.claude/fork-watch-sweep-stamp"
+sum2b=$(find "$T/.claude" -type f -exec md5sum {} + | sort)
+run
+sum2c=$(find "$T/.claude" -type f -exec md5sum {} + | sort)
+if [ "$sum2b" = "$sum2c" ]; then echo "STABLE: aged-stamp run changed nothing"; else echo "UNSTABLE:"; diff <(echo "$sum2b") <(echo "$sum2c"); fi
 
 echo "--- stamp skip + heal ---"
 jq '.name="[Dead] Global"' "$T/.claude/jobs/cccc2222/state.json" > "$T/x" && mv "$T/x" "$T/.claude/jobs/cccc2222/state.json"
@@ -116,3 +177,31 @@ echo "fresh stamp  (want [Dead] Global untouched, sweeps skipped): $(jn cccc2222
 rm -f "$T/.claude/fork-watch-sweep-stamp"
 run
 echo "stamp gone   (want Global healed): $(jn cccc2222)"
+
+echo "--- fresh stamp + new write: first-open marks override the skip ---"
+LU1="0a0a0a0a-0a0a-0a0a-0a0a-0a0a0a0a0a0a"
+LU2="a0a0a0a0-a0a0-a0a0-a0a0-a0a0a0a0a0a0"
+LF1="$P/fade0001-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"LateT"}\n{"uuid":"%s","type":"user"}\n' "$LU1" > "$LF1"; old "$LF1"
+LF2="$P/fade0002-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"LateT"}\n{"uuid":"%s","type":"user"}\n{"uuid":"%s","type":"user"}\n' "$LU1" "$LU2" > "$LF2"
+run
+echo "late flush   (want [Old Fork] LateT despite fresh stamp): $(ft "$LF1")"
+
+echo "--- streaming write protection ---"
+SU1="0e0e0e0e-0e0e-0e0e-0e0e-0e0e0e0e0e0e"
+SU2="e0e0e0e0-e0e0-e0e0-e0e0-e0e0e0e0e0e0"
+SP1="$P/feed0001-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"StreamT"}\n{"uuid":"%s","type":"user"}\n{"uuid":"%s","type":"user"}\n' "$SU1" "$SU2" > "$SP1"; old "$SP1"
+SP2="$P/feed0002-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"StreamT"}\n{"uuid":"%s","type":"user"}\n' "$SU1" > "$SP2"
+( for i in $(seq 1 150); do printf '{"type":"noise","n":%s}\n' "$i" >> "$SP2"; sleep 0.05; done ) >/dev/null 2>&1 &
+wpid=$!
+rm -f "$T/.claude/fork-watch-sweep-stamp"
+run
+echo "streaming twin (want no custom-title, write in progress): $(ft "$SP2")"
+kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+old "$SP2"
+rm -f "$T/.claude/fork-watch-sweep-stamp"
+run
+echo "stopped twin  (want [Old Fork] StreamT): $(ft "$SP2")"

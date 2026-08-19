@@ -81,8 +81,9 @@ pid_matches_start() {
 # enough to finish before launch. Loaded once by the main flow.
 declare -A R_PID R_PST R_LSRC R_MODE R_FORK R_TS
 declare -A J_SEEN J_NAME J_SID J_MTIME J_MTIMEF
-declare -A T_SEEN T_TITLE T_HASUUID T_MTIME T_HASCT
+declare -A T_SEEN T_TITLE T_HASUUID T_MTIME T_HASCT T_HOT
 declare -A LU_SEEN LU_VAL
+declare -A LR_SEEN LR_VAL
 
 load_roster() {
   # Single jq over the roster; .workers is an OBJECT keyed by the 8-char id.
@@ -129,15 +130,10 @@ EOF
 }
 
 scan_transcripts() {
-  # One pass over every project transcript: uuid presence (one grep -l),
-  # mtimes (one stat), display titles (one grep -H piped through awk+jq —
-  # awk wraps each candidate line as {"f":file,"l":line} so a single jq can
-  # both filter out message lines that merely contain the marker text and
-  # extract the title; real title lines are short, so awk drops over-long
-  # matches early — they are message lines jq would filter anyway).
-  # The current session's own file is left unscanned so later checks on it
-  # always hit the live file, not a stale snapshot.
-  local files=() pdirx f ftype tval mt
+  # Collects every project transcript and scans them in one pass. The current
+  # session's own file is left unscanned so later checks on it always hit the
+  # live file, not a stale snapshot.
+  local files=() pdirx f
   for pdirx in "$HOME"/.claude/projects/*/; do
     for f in "$pdirx"*.jsonl; do
       [ -e "$f" ] || continue
@@ -147,12 +143,24 @@ scan_transcripts() {
     done
   done
   [ ${#files[@]} -gt 0 ] || return 0
+  scan_files "${files[@]}"
+}
+
+scan_files() {
+  # $@ = transcript paths. One pass: uuid presence (one grep -l), mtimes (one
+  # stat), display titles (one grep -H piped through awk+jq — awk wraps each
+  # candidate line as {"f":file,"l":line} so a single jq can both filter out
+  # message lines that merely contain the marker text and extract the title;
+  # real title lines are short, so awk drops over-long matches early — they
+  # are message lines jq would filter anyway). Also re-scans files that
+  # settled after an in-flight write (settle_hot_files).
+  local f ftype tval mt
   while IFS= read -r f; do
     [ -n "$f" ] && T_HASUUID[$f]=1
-  done < <(grep -l '"uuid":"' "${files[@]}" 2>/dev/null)
+  done < <(grep -l '"uuid":"' "$@" 2>/dev/null)
   while read -r mt f; do
     [ -n "$f" ] && T_MTIME[$f]=$mt
-  done < <(stat -c '%Y %n' "${files[@]}" 2>/dev/null)
+  done < <(stat -c '%Y %n' "$@" 2>/dev/null)
   while IFS=$'\x1f' read -r f ftype tval; do
     [ -n "$f" ] || continue
     if [ "$ftype" = "custom-title" ]; then
@@ -160,7 +168,63 @@ scan_transcripts() {
     elif [ -z "${T_HASCT[$f]}" ]; then
       T_TITLE[$f]=$tval
     fi
-  done < <(grep -H -E '"type":"(custom-title|ai-title)"' "${files[@]}" 2>/dev/null | awk 'length($0) < 4096 { i=index($0,":"); printf "{\"f\":\"%s\",\"l\":%s}\n", substr($0,1,i-1), substr($0,i+1) }' | jq -Rr --arg us $'\x1f' 'fromjson? | select(.l.type=="custom-title" or .l.type=="ai-title") | [.f, .l.type, (.l.customTitle // .l.aiTitle // "")] | join($us)')
+  done < <(grep -H -E '"type":"(custom-title|ai-title)"' "$@" 2>/dev/null | awk 'length($0) < 4096 { i=index($0,":"); printf "{\"f\":\"%s\",\"l\":%s}\n", substr($0,1,i-1), substr($0,i+1) }' | jq -Rr --arg us $'\x1f' 'fromjson? | select(.l.type=="custom-title" or .l.type=="ai-title") | [.f, .l.type, (.l.customTitle // .l.aiTitle // "")] | join($us)')
+}
+
+settle_hot_files() {
+  # In-flight writes are waited out rather than skipped. A daemon flush is a
+  # sub-second burst that clusters around exactly the moments sweeps run —
+  # the same keypress (view open, client exit) triggers both the writer and
+  # the reader — so polling every 100ms catches the write's end almost
+  # immediately and the marks still land on the first open. Each file settles
+  # on its own: quiet for 3 consecutive polls = settled; changed on 5 polls =
+  # a genuinely streaming session -> T_HOT at once, never marked this run. A
+  # streaming session must not hold the poll loop, or every view open would
+  # stall the full cap while any session is active. Settled files are
+  # re-scanned so no torn read survives.
+  local f hot=() i sz mtf name
+  local -A sig=() quiet=() changes=() left=() seen=()
+  for f in "${!T_SEEN[@]}"; do
+    [ -n "${T_MTIME[$f]}" ] || continue
+    [ $((NOW - T_MTIME[$f])) -lt 5 ] && hot+=("$f")
+  done
+  [ ${#hot[@]} -gt 0 ] || return 0
+  while read -r sz mtf name; do
+    [ -n "$name" ] || continue
+    sig[$name]="$sz $mtf"; left[$name]=1
+  done < <(stat -c '%s %.Y %n' "${hot[@]}" 2>/dev/null)
+  for ((i = 0; i < 30; i++)); do
+    [ ${#left[@]} -gt 0 ] || break
+    sleep 0.1
+    seen=()
+    while read -r sz mtf name; do
+      [ -n "$name" ] || continue
+      seen[$name]=1
+      [ -n "${left[$name]}" ] || continue
+      if [ "${sig[$name]}" = "$sz $mtf" ]; then
+        quiet[$name]=$(( ${quiet[$name]:-0} + 1 ))
+        [ "${quiet[$name]}" -ge 3 ] && unset "left[$name]"
+      else
+        sig[$name]="$sz $mtf"; quiet[$name]=0
+        changes[$name]=$(( ${changes[$name]:-0} + 1 ))
+        if [ "${changes[$name]}" -ge 5 ]; then
+          T_HOT[$name]=1; unset "left[$name]"
+        fi
+      fi
+    done < <(stat -c '%s %.Y %n' "${hot[@]}" 2>/dev/null)
+    for f in "${!left[@]}"; do
+      # A file deleted mid-poll produces no stat line; nothing to wait for.
+      [ -n "${seen[$f]}" ] || unset "left[$f]"
+    done
+  done
+  # Cap hit with stragglers: intermittent writers that neither settled nor
+  # crossed the change threshold — still being written, skip this run.
+  for f in "${!left[@]}"; do T_HOT[$f]=1; done
+  for f in "${hot[@]}"; do
+    unset "T_HASUUID[$f]" "T_HASCT[$f]" "LU_SEEN[$f]" "LU_VAL[$f]" "LR_SEEN[$f]" "LR_VAL[$f]"
+    T_TITLE[$f]=
+  done
+  scan_files "${hot[@]}"
 }
 
 worker_live() {
@@ -293,25 +357,49 @@ last_uuid() {
     return
   fi
   local u
-  u=$(tac "$1" 2>/dev/null | grep -m1 -oE '"uuid":"[0-9a-f-]{36}"' | grep -oE '[0-9a-f-]{36}')
+  u=$(tac "$1" 2>/dev/null | grep -m1 -oE '"uuid":"[0-9a-f-]{36}"')
+  u=${u#'"uuid":"'}; u=${u%'"'}
   LU_SEEN[$1]=1; LU_VAL[$1]=$u
   printf '%s' "$u"
 }
 
+last_real_uuid() {
+  # Prints the last CONVERSATION uuid of transcript $1: user/assistant entries
+  # only, skipping the junk Claude Code also gives uuids to — attachments,
+  # user entries holding only a system-reminder (rename notifications), and
+  # "No response requested." assistant fillers. Fork copies gain such junk
+  # without the conversation moving, so twin-vs-superseded verdicts compare
+  # these, not the raw last uuid. Memoized, and reads from the file's END:
+  # tac streams lines newest-first, jq --unbuffered emits the first match
+  # immediately, and head -1 then kills the pipe — so the cost is the length
+  # of the junk tail, not the file size (a full-file jq parse costs ~200ms on
+  # a 10MB transcript; this stays sub-millisecond).
+  if [ -n "${LR_SEEN[$1]}" ]; then
+    printf '%s' "${LR_VAL[$1]}"
+    return
+  fi
+  local u
+  u=$(tac "$1" 2>/dev/null | jq --unbuffered -Rr 'fromjson? | select(.type=="user" or .type=="assistant") | select(.uuid != null) | (.message.content | if type=="string" then . else (.[0].text // .[0].type // "") end) as $t | select(($t | startswith("<system-reminder>") | not) and ($t != "No response requested.")) | .uuid' 2>/dev/null | head -1)
+  LR_SEEN[$1]=1; LR_VAL[$1]=$u
+  printf '%s' "$u"
+}
+
 is_liveish() {
-  # $1 = transcript path. True when the session has a live worker or the file
-  # was written in the last 10 minutes — likely someone's active window, which
-  # must never be marked (non-daemon interactive sessions are invisible to the
-  # roster, so recency is the only signal for them).
+  # $1 = transcript path. True when the session has a live worker, or when
+  # the file was still being streamed to after the settle wait (T_HOT). There
+  # is no recency window for scanned files: settle_hot_files already waited
+  # out any in-flight write, so a settled file is judged immediately and
+  # marks land on the first open. A file outside the scan (only the current
+  # session's own) keeps a 60s recency guard.
   local fid mt
   fid=${1##*/}; fid=${fid%.jsonl}
   worker_live "$fid" && return 0
-  if [ -n "${T_SEEN[$1]}" ] && [ -n "${T_MTIME[$1]}" ]; then
-    mt=${T_MTIME[$1]}
-  else
-    mt=$(stat -c %Y "$1" 2>/dev/null) || return 1
+  if [ -n "${T_SEEN[$1]}" ]; then
+    [ -n "${T_HOT[$1]}" ]
+    return
   fi
-  [ $((NOW - mt)) -lt 600 ]
+  mt=$(stat -c %Y "$1" 2>/dev/null) || return 1
+  [ $((NOW - mt)) -lt 60 ]
 }
 
 retitle() {
@@ -414,16 +502,32 @@ sweep_transcripts() {
   #   is written lazily) — heal any leftover mark. Once unservable it is a
   #   husk -> "[Stub] ".
   # - A real transcript wrongly marked "[Stub] " is healed.
-  # - A real transcript marked "[Old Fork] " whose last message no longer
-  #   exists in any sibling has diverged past its fork — no longer superseded,
-  #   healed back.
-  local pdirx f fid mt title last
+  # - A real transcript marked "[Old Fork] " whose last CONVERSATION message
+  #   no longer exists in any sibling has diverged past its fork — no longer
+  #   superseded, healed back. Junk tails (entries minted in this file alone)
+  #   are never grounds to heal.
+  local pdirx f fid mt title last rlast pmax line mf mu g pats hcfiles rfiles
   for pdirx in "$HOME"/.claude/projects/*/; do
+    # Content-driven checks (stub heals, bare tokens, divergence heals) are
+    # skipped when nothing in the project was written since the last completed
+    # sweep ($sm): their verdicts depend only on file contents, which the
+    # previous sweep already judged. Time- and roster-driven husk logic below
+    # still runs every sweep.
+    pmax=0
+    for f in "$pdirx"*.jsonl; do
+      [ -e "$f" ] || continue
+      mt=${T_MTIME[$f]}
+      [ -n "$mt" ] || mt=$NOW
+      [ "$mt" -gt "$pmax" ] && pmax=$mt
+    done
+    local -A HC_LAST=()
+    hcfiles=()
     for f in "$pdirx"*.jsonl; do
       [ -e "$f" ] || continue
       [ "$f" = "$tpath" ] && continue
       fid=${f##*/}; fid=${fid%.jsonl}
       if has_uuids "$f"; then
+        [ "$pmax" -lt "$sm" ] && continue
         title=$(file_title "$f")
         case "$title" in
           "[Stub] "*)
@@ -437,12 +541,11 @@ sweep_transcripts() {
             retitle "$f" ""
             ;;
           "[Old Fork] "*|"[Dup] "*)
+            # Divergence heals are judged in one batched pass after the loop.
             last=$(last_uuid "$f")
             [ -n "$last" ] || continue
-            if ! grep -l "\"uuid\":\"$last\"" "$pdirx"*.jsonl 2>/dev/null | grep -v -F "$f" | grep -q .; then
-              retitle "$f" ""
-              set_job_marker "$fid" ""
-            fi
+            HC_LAST[$f]=$last
+            hcfiles+=("$f")
             ;;
         esac
         continue
@@ -459,6 +562,60 @@ sweep_transcripts() {
       else
         retitle "$f" "[Stub] "
       fi
+    done
+    # Batched divergence heals: ONE grep per project with every marked tail
+    # as a pattern (-o prints just the matched tokens) instead of one
+    # full-directory grep per marked file. A tail found in a sibling means
+    # the conversation lives on — the mark stays.
+    [ ${#hcfiles[@]} -gt 0 ] || continue
+    pats=""
+    for f in "${hcfiles[@]}"; do
+      pats="$pats\"uuid\":\"${HC_LAST[$f]}\""$'\n'
+    done
+    local -A alive=()
+    while IFS= read -r line; do
+      mf=${line%%:*}
+      mu=${line#*:}; mu=${mu#'"uuid":"'}; mu=${mu%'"'}
+      [ -n "$mf" ] && [ -n "$mu" ] && alive[$mu]="${alive[$mu]}$mf"$'\n'
+    done < <(printf '%s' "$pats" | grep -HoF -f /dev/stdin "$pdirx"*.jsonl 2>/dev/null)
+    # An orphaned raw tail is re-judged on the conversation tail (a junk tail
+    # — an entry minted in this file alone — is always orphaned, and healing
+    # on one would re-mark and re-heal on every sweep). Only a conversation
+    # tail no sibling holds means the session truly diverged -> heal.
+    rfiles=()
+    local -A HC_RLAST=()
+    for f in "${hcfiles[@]}"; do
+      last=${HC_LAST[$f]}
+      g=${alive[$last]//"$f"$'\n'/}
+      [ -n "$g" ] && continue
+      rlast=$(last_real_uuid "$f")
+      if [ -n "$rlast" ] && [ "$rlast" != "$last" ]; then
+        HC_RLAST[$f]=$rlast
+        rfiles+=("$f")
+      else
+        fid=${f##*/}; fid=${fid%.jsonl}
+        retitle "$f" ""
+        set_job_marker "$fid" ""
+      fi
+    done
+    [ ${#rfiles[@]} -gt 0 ] || continue
+    pats=""
+    for f in "${rfiles[@]}"; do
+      pats="$pats\"uuid\":\"${HC_RLAST[$f]}\""$'\n'
+    done
+    local -A ralive=()
+    while IFS= read -r line; do
+      mf=${line%%:*}
+      mu=${line#*:}; mu=${mu#'"uuid":"'}; mu=${mu%'"'}
+      [ -n "$mf" ] && [ -n "$mu" ] && ralive[$mu]="${ralive[$mu]}$mf"$'\n'
+    done < <(printf '%s' "$pats" | grep -HoF -f /dev/stdin "$pdirx"*.jsonl 2>/dev/null)
+    for f in "${rfiles[@]}"; do
+      rlast=${HC_RLAST[$f]}
+      g=${ralive[$rlast]//"$f"$'\n'/}
+      [ -n "$g" ] && continue
+      fid=${f##*/}; fid=${fid%.jsonl}
+      retitle "$f" ""
+      set_job_marker "$fid" ""
     done
   done
 }
@@ -536,9 +693,10 @@ sweep_copy_dups() {
   # so several real transcripts can hold the same conversation (they share the
   # title and message uuids). Within each same-title group: a file whose tail
   # is contained in a longer sibling is superseded -> "[Old Fork] "; identical
-  # twins keep one unmarked and the cold rest get "[Dup] ". Live/hot files
-  # (worker or written <10 min ago) are never marked.
-  local pdirx f g title fl gl fid twins newest_cold newest_cold_mt mt liveish_twin n
+  # twins keep one unmarked and the cold rest get "[Dup] ". Live/streaming
+  # files (worker, or still being written after the settle wait) are never
+  # marked.
+  local pdirx f g title fl gl fid newest_cold newest_cold_mt mt liveish_twin n gmax
   for pdirx in "$HOME"/.claude/projects/*/; do
     declare -A CD_GROUP=()
     for f in "$pdirx"*.jsonl; do
@@ -554,43 +712,98 @@ sweep_copy_dups() {
     for title in "${!CD_GROUP[@]}"; do
       local files=()
       mapfile -t files <<< "${CD_GROUP[$title]}"
-      n=0
+      n=0; gmax=0
       for f in "${files[@]}"; do
-        [ -n "$f" ] && n=$((n + 1))
+        [ -n "$f" ] || continue
+        n=$((n + 1))
+        mt=${T_MTIME[$f]}
+        [ -n "$mt" ] || mt=$NOW
+        [ "$mt" -gt "$gmax" ] && gmax=$mt
       done
       [ "$n" -ge 2 ] || continue
-      twins=""
+      # No member written since the last completed sweep: the verdicts are
+      # content-only and already landed — skip the group.
+      [ "$gmax" -lt "$sm" ] && continue
+      # Containment matrix: ONE grep per file, fed every sibling raw tail as a
+      # fixed pattern (-o prints just the matched uuid tokens, so multi-MB
+      # message lines never hit the pipe) — n spawns instead of n^2 pairwise
+      # greps, which dominated the sweep on real trees.
+      local pats=""
+      local -A tails=() contains=()
       for f in "${files[@]}"; do
         [ -n "$f" ] || continue
         fl=$(last_uuid "$f")
         [ -n "$fl" ] || continue
-        local superseded="" mutual=""
+        tails[$f]=$fl
+        pats="$pats\"uuid\":\"$fl\""$'\n'
+      done
+      for f in "${files[@]}"; do
+        [ -n "$f" ] || continue
+        while IFS= read -r gl; do
+          gl=${gl#'"uuid":"'}; gl=${gl%'"'}
+          [ -n "$gl" ] && contains[$f$'\x1f'$gl]=1
+        done < <(printf '%s' "$pats" | grep -oF -f /dev/stdin "$f" 2>/dev/null)
+      done
+      local -A twinset=()
+      for f in "${files[@]}"; do
+        [ -n "$f" ] || continue
+        fl=${tails[$f]}
+        [ -n "$fl" ] || continue
+        local superseded="" mutual="" hit="" rf rg
         for g in "${files[@]}"; do
           [ -n "$g" ] && [ "$g" != "$f" ] || continue
-          if grep -qF "\"uuid\":\"$fl\"" "$g"; then
-            gl=$(last_uuid "$g")
-            if [ -n "$gl" ] && grep -qF "\"uuid\":\"$gl\"" "$f"; then
+          if [ -n "${contains[$g$'\x1f'$fl]}" ]; then
+            hit=1
+            gl=${tails[$g]}
+            if [ -n "$gl" ] && [ -n "${contains[$f$'\x1f'$gl]}" ]; then
               mutual=1
             else
-              superseded=1
+              # Raw uuids say g is ahead — but when g's extra entries are only
+              # junk, the conversations are identical and this is a twin pair,
+              # not a supersede: re-judge on conversation uuids.
+              rf=$(last_real_uuid "$f")
+              rg=$(last_real_uuid "$g")
+              if [ -n "$rf" ] && [ -n "$rg" ] && grep -qF "\"uuid\":\"$rf\"" "$g" && grep -qF "\"uuid\":\"$rg\"" "$f"; then
+                mutual=1
+              else
+                superseded=1
+              fi
             fi
           fi
         done
+        if [ -z "$hit" ]; then
+          # The raw tail matched no sibling — but a junk tail (an entry minted
+          # in this file alone) always looks that way, hiding both twinship
+          # and a genuine supersede: retry the scan on the conversation tail.
+          rf=$(last_real_uuid "$f")
+          if [ -n "$rf" ] && [ "$rf" != "$fl" ]; then
+            for g in "${files[@]}"; do
+              [ -n "$g" ] && [ "$g" != "$f" ] || continue
+              grep -qF "\"uuid\":\"$rf\"" "$g" || continue
+              rg=$(last_real_uuid "$g")
+              if [ -n "$rg" ] && grep -qF "\"uuid\":\"$rg\"" "$f"; then
+                mutual=1
+              else
+                superseded=1
+              fi
+            done
+          fi
+        fi
         if [ -n "$superseded" ]; then
           if ! is_liveish "$f"; then
             fid=${f##*/}; fid=${fid%.jsonl}
             retitle "$f" "[Old Fork] " && set_job_marker "$fid" "[Old Fork] "
           fi
         elif [ -n "$mutual" ]; then
-          twins="$twins$f"$'\n'
+          twinset[$f]=1
         fi
       done
       # Identical twins: if any is live/hot it is the keeper and every cold
       # twin is redundant; among only-cold twins the newest keeps its name.
-      [ -n "$twins" ] || continue
+      # Supersede outranks twinship, so a superseded file is never in the set.
+      [ ${#twinset[@]} -gt 0 ] || continue
       liveish_twin=""; newest_cold=""; newest_cold_mt=0
-      while IFS= read -r f; do
-        [ -n "$f" ] || continue
+      for f in "${!twinset[@]}"; do
         if is_liveish "$f"; then
           liveish_twin=1
         else
@@ -598,11 +811,8 @@ sweep_copy_dups() {
           [ -n "$mt" ] || mt=$(stat -c %Y "$f" 2>/dev/null) || mt=0
           if [ "$mt" -gt "$newest_cold_mt" ]; then newest_cold_mt=$mt; newest_cold="$f"; fi
         fi
-      done <<EOF
-$twins
-EOF
-      while IFS= read -r f; do
-        [ -n "$f" ] || continue
+      done
+      for f in "${!twinset[@]}"; do
         fid=${f##*/}; fid=${fid%.jsonl}
         if is_liveish "$f" || { [ -z "$liveish_twin" ] && [ "$f" = "$newest_cold" ]; }; then
           # The kept twin (live/hot, or the newest cold one) must not carry a
@@ -612,9 +822,7 @@ EOF
           continue
         fi
         retitle "$f" "[Dup] " && set_job_marker "$fid" "[Dup] "
-      done <<EOF
-$twins
-EOF
+      done
     done
     unset CD_GROUP
   done
@@ -672,23 +880,61 @@ handle_fork() {
   jq -cn --arg m "$msg" '{systemMessage:$m}'
 }
 
+sweeps_current() {
+  # The stamp proves a sweep ran; it does not prove nothing happened since.
+  # Writes that can change a verdict void the skip: a roster change, a project
+  # directory change (a transcript appeared, vanished or was renamed —
+  # materialized fork copies arrive this way), or a write to a transcript or
+  # job of a session with NO live worker (a daemon flush of an exited
+  # session). Live sessions are exempt: a live row is never marked, the
+  # daemon rewrites a running job's state.json every few seconds, and a live
+  # transcript's growth cannot create containment that did not exist when the
+  # file appeared (new files are caught by the directory mtime). Names are
+  # read once at view open and the settle wait exists precisely so marks land
+  # on the first open after a write ends: when in doubt, sweep.
+  # Strict comparison: mtimes are whole seconds, so a write in the SAME
+  # second as the stamp must count as newer — the cost is at most one
+  # redundant sweep right after an eventful one.
+  local mt f fid
+  while read -r mt f; do
+    [ -n "$f" ] || continue
+    [ "$mt" -lt "$sm" ] && continue
+    case "$f" in
+      *.jsonl)
+        [ "$f" = "$tpath" ] && continue
+        fid=${f##*/}; fid=${fid%.jsonl}
+        worker_live "$fid" && continue
+        ;;
+      */state.json)
+        fid=${f%/state.json}; fid=${fid##*/}
+        worker_live "$fid" && continue
+        ;;
+    esac
+    return 1
+  done < <(stat -c '%Y %n' "$HOME"/.claude/projects/*/ "$HOME"/.claude/projects/*/*.jsonl "$HOME"/.claude/jobs/*/state.json "$HOME"/.claude/daemon/roster.json 2>/dev/null)
+  return 0
+}
+
 # Sweeps run first: the agents view reads job names once at open, racing this
 # hook — the marks must land before find_parent's probe wait. A sweep stamp
 # under 30s old means another run just swept (the claude() wrapper sweeps
 # right before opening the view, then the view's own SessionStart hook fires
-# moments later): the marks are current, so the sweeps and their scans are
-# skipped — and a sweep-only run has nothing left to do at all, so it exits
-# before even the roster load. Hook mode still loads the roster on the skip
-# path, because fork detection below needs it.
+# moments later): if nothing was written since, the marks are current and the
+# sweeps and their scans are skipped — a sweep-only run then exits before
+# even the roster load, while hook mode still loads the roster for the fork
+# detection below. Any write since the stamp voids the skip.
 sweep_stamp="$HOME/.claude/fork-watch-sweep-stamp"
 sm=$(stat -c %Y "$sweep_stamp" 2>/dev/null) || sm=0
-if [ $((NOW - sm)) -lt 30 ]; then
+# The roster is loaded before the skip decision: sweeps_current needs
+# worker_live for its live-session exemptions, and hook-mode fork detection
+# needs it either way.
+load_roster
+if [ $((NOW - sm)) -lt 30 ] && sweeps_current; then
   [ -n "$sweep_only" ] && exit 0
-  load_roster
 else
-  load_roster
   load_jobs
   scan_transcripts
+  settle_hot_files
   sweep_transcripts
   sweep_dead_jobs
   sweep_dups

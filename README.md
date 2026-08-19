@@ -23,7 +23,7 @@ Two hooks plus a shell wrapper. Append/rename only — nothing is ever deleted, 
 | Marker | Meaning |
 |---|---|
 | `[Old Fork] ` | Transcript superseded by a copy holding the same conversation. Heals when the session diverges past the fork. |
-| `[Dup] ` | Redundant duplicate: an at-rest twin fork of the same parent, a fork shell whose parent conversation another row already carries, or the cold copy of identical same-title twins. |
+| `[Dup] ` | Redundant duplicate: an at-rest twin fork of the same parent, a fork shell whose parent conversation another row already carries, or the cold copy of identical same-title twins. Twin-vs-superseded is judged on conversation entries only — junk that Claude Code also gives uuids to (attachments, system-reminder-only user entries, "No response requested." fillers) never turns a twin into an `[Old Fork] `. |
 | `[Dead] ` | Job row that can never produce a conversation again: no real transcript and no live or respawnable worker. |
 | `[Stub] ` | Transcript with a title but zero messages whose session is unservable — it would open empty. |
 
@@ -47,13 +47,17 @@ Then add the two printed blocks (hook registration in `~/.claude/settings.json`,
 
 ## Design notes
 
-- Everything loads once per run into bash caches (one jq for the roster, one jq+stat for all job files, one grep/awk/jq pipeline for all titles): ~0.6s per sweep instead of ~10s with per-file spawns on WSL.
+- Everything loads once per run into bash caches (one jq for the roster, one jq+stat for all job files, one grep/awk/jq pipeline for all titles) — per-file spawns cost ~10s on WSL before this. Current costs on a ~100MB tree: ~40ms when nothing changed since the stamp, ~0.5-0.8s when something flushed, ~2s only when the stamp is missing entirely (first install).
+- Content-driven verdicts (copy-dup groups, divergence heals) are skipped for anything not written since the last completed sweep — those verdicts depend only on file contents the previous sweep already judged. Time- and roster-driven checks still run every sweep. On a ~100MB tree this cuts a steady-state sweep to well under a second.
+- Same-title groups are judged via a containment matrix: one `grep -oF -f` per file with every sibling tail uuid as a pattern, instead of n² pairwise greps. Divergence heals batch the same way — one grep per project with every marked tail as a pattern, instead of one full-directory grep per marked file.
+- The junk-tail fallback reads from the file's end (`tac | jq --unbuffered | head -1`), so its cost is the junk-tail length, not the file size.
 - Loader field separators are US `0x1f` (`jq --arg us $'\x1f'`), not tabs — tab is IFS whitespace, so empty fields would collapse and shift columns.
-- A sweep stamp under 30s old skips the sweeps, so wrapper-then-hook double runs cost one sweep.
+- A sweep stamp under 30s old skips the sweeps — but only when nothing was written since the stamp (one cheap stat pass over project dirs, transcripts, jobs and the roster). A flush or rename after the stamp voids the skip, so marks still land on the very first open after a write ends; live sessions' own writes are exempt from voiding it, since a live row is never marked. Same-second writes count as newer (mtimes are whole seconds), at worst costing one redundant sweep.
 - `state.json` writes abort when the file's `%.Y` mtime changed mid-flight, so a concurrent daemon rename is never clobbered.
 - Transcript title appends restore the file's mtime when it was idle, because `claude --continue` resumes by recency; hot files are never backdated.
-- Live sessions (live worker, or file written <10 min ago) are never marked.
+- Live sessions are never marked, and there is no recency window: a file written in the last 5s is polled every 100ms and judged once settled — daemon flushes are sub-second bursts triggered by the same keypress that starts the sweep, so waiting them out lets marks land on the first open without ever reading a half-written file. Each file settles on its own: quiet for 3 consecutive polls is settled and re-scanned; changed on 5 polls is a genuinely streaming session, skipped for that run immediately so one active session never stalls the sweep to the 3s cap.
 - Claude Code seeds a forked session's ai-title from the parent's displayed name, so marker text can leak into a new session's title; a base that is only a bare marker token is replaced with the short session id.
+- Whenever a file's raw tail uuid matches no sibling — always the case when the tail is junk minted in that file alone — duplicate verdicts, marker healing and the session-end supersede check all fall back to the last conversation uuid, so junk can neither hide a duplicate nor cause heal/re-mark churn.
 
 ## Cleanup recipe
 
