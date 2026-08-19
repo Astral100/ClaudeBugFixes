@@ -30,6 +30,24 @@ claude() {
     command claude agents --cwd "$PWD" "$@"
   elif [ "$1" = "--resume" ] || [ "$1" = "-r" ]; then
     timeout 10 bash "$HOME/.claude/scripts/fork-watch.sh" --sweep-only 2>/dev/null
+    # A foreground resume of a roster-owned session errors ("still running as
+    # a background agent") and suggests --fork-session, which mints a
+    # duplicate. The daemon can attach (and respawn a dead worker) instead:
+    # redirect explicit-id resumes to `claude attach` unless a fork was
+    # asked for.
+    case "$2" in
+      [0-9a-f]*-*)
+        case " $* " in
+          *" --fork-session "*) ;;
+          *)
+            if jq -e --arg k "${2:0:8}" '.workers[$k] != null' "$HOME/.claude/daemon/roster.json" >/dev/null 2>&1; then
+              command claude attach "${2:0:8}"
+              return
+            fi
+            ;;
+        esac
+        ;;
+    esac
     command claude "$@"
   else
     command claude "$@"
