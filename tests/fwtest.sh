@@ -205,3 +205,89 @@ old "$SP2"
 rm -f "$T/.claude/fork-watch-sweep-stamp"
 run
 echo "stopped twin  (want [Old Fork] StreamT): $(ft "$SP2")"
+
+echo "--- provisional [Dup?]: fresh roster forks marked from roster info alone ---"
+# Parents (transcripts only, no job rows)
+PD="$P/dd44dd44-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"SoloB"}\n{"uuid":"%s","type":"user"}\n' "$(uu f)" > "$PD"; old "$PD"
+PE="$P/ee55ee55-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"SoloC"}\n{"uuid":"ba21ba21-ba21-ba21-ba21-ba21ba21ba21","type":"user"}\n' > "$PE"; old "$PE"
+PF="$P/ff66ff66-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"SoloD"}\n{"uuid":"fa01fa01-fa01-fa01-fa01-fa01fa01fa01","type":"user"}\n' > "$PF"; old "$PF"
+# Fresh fork WITH a diverged transcript: no content verdict possible, the
+# provisional must survive the run (and the parent is a genuine [Old Fork])
+DU1="ab12ab12-ab12-ab12-ab12-ab12ab12ab12"
+DF="$P/abcd0001-0000-0000-0000-000000000001.jsonl"
+printf '{"type":"ai-title","aiTitle":"SoloB"}\n{"uuid":"%s","type":"user"}\n{"uuid":"%s","type":"user","message":{"role":"user","content":"more"}}\n' "$(uu f)" "$DU1" > "$DF"; old "$DF"
+mkjob abcd0001 "FreshFork" "abcd0001-0000-0000-0000-000000000001"
+# Fresh sole fork SHELL (no transcript): healed clean in the same run
+mkjob abcd0003 "FreshShell" "abcd0003-0000-0000-0000-000000000001"
+# Fresh twin shells of one parent: older upgraded to a final [Dup], keeper healed
+mkjob abcd0004 "TwinG1" "abcd0004-0000-0000-0000-000000000001"
+mkjob abcd0005 "TwinG2" "abcd0005-0000-0000-0000-000000000001"
+NOWMS=$(( $(date +%s) * 1000 ))
+roster_with_fresh() {
+  # $1 = startedAt for the diverged fork abcd0001
+  cat > "$T/.claude/daemon/roster.json" <<EOF2
+{"workers":{
+ "bbbb1111":{"pid":99999901,"startedAt":100,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PA"}}},
+ "cccc2222":{"pid":99999902,"startedAt":200,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PA"}}},
+ "dddd3333":{"pid":99999903,"startedAt":300,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PB"}}},
+ "eeee4444":{"pid":99999904,"startedAt":400,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PC"}}},
+ "abcd0001":{"pid":99999905,"startedAt":$1,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PD"}}},
+ "abcd0003":{"pid":99999907,"startedAt":$NOWMS,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PF"}}},
+ "abcd0004":{"pid":99999908,"startedAt":$NOWMS,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PE"}}},
+ "abcd0005":{"pid":99999909,"startedAt":$(( NOWMS + 5 )),"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PE"}}}
+}}
+EOF2
+}
+roster_with_fresh "$NOWMS"
+rm -f "$T/.claude/fork-watch-sweep-stamp"
+run
+echo "diverged fork (want [Dup?] FreshFork, no content verdict yet): $(jn abcd0001)"
+echo "its parent    (want [Old Fork] SoloB): $(ft "$PD")"
+echo "sole shell    (want FreshShell, healed same-run): $(jn abcd0003)"
+echo "older twin    (want [Dup] TwinG1, upgraded to final): $(jn abcd0004)"
+echo "keeper twin   (want TwinG2, healed same-run): $(jn abcd0005)"
+echo "stale solo    (want Solo, old startedAt never provisional): $(jn dddd3333)"
+
+echo "--- provisional expiry: a completed sweep outranks the provisional ---"
+# startedAt now predates the sweep stamp -> not eligible, [Dup?] heals off
+roster_with_fresh $(( NOWMS - 60000 ))
+run
+echo "expired fork  (want FreshFork healed): $(jn abcd0001)"
+
+echo "--- provisional never downgrades a real verdict ---"
+jq '.name="[Dup] FreshFork"' "$T/.claude/jobs/abcd0001/state.json" > "$T/x" && mv "$T/x" "$T/.claude/jobs/abcd0001/state.json"
+touch -m -d '1 hour ago' "$T/.claude/jobs/abcd0001/state.json"
+roster_with_fresh "$NOWMS"
+rm -f "$T/.claude/fork-watch-sweep-stamp"
+run
+echo "real verdict  (want [Dup] FreshFork kept, no [Dup?] downgrade): $(jn abcd0001)"
+
+echo "--- ← left-press tag: fork of a recently-active parent ---"
+NOWMS2=$(( $(date +%s) * 1000 ))
+PG="$P/aabb0001-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"SoloE"}\n{"uuid":"ea01ea01-ea01-ea01-ea01-ea01ea01ea01","type":"user"}\n' > "$PG"; touch -m -d '90 seconds ago' "$PG"
+PH="$P/aabb0002-0000-0000-0000-000000000000.jsonl"
+printf '{"type":"ai-title","aiTitle":"SoloF"}\n{"uuid":"fb02fb02-fb02-fb02-fb02-fb02fb02fb02","type":"user"}\n' > "$PH"; touch -m -d '90 seconds ago' "$PH"
+# Diverged materialized fork of the ACTIVE parent -> [←Dup?] survives the run
+AF="$P/abcd0006-0000-0000-0000-000000000001.jsonl"
+printf '{"type":"ai-title","aiTitle":"SoloE"}\n{"uuid":"ea01ea01-ea01-ea01-ea01-ea01ea01ea01","type":"user"}\n{"uuid":"ce03ce03-ce03-ce03-ce03-ce03ce03ce03","type":"user","message":{"role":"user","content":"more"}}\n' > "$AF"; old "$AF"
+mkjob abcd0006 "FreshForkL" "abcd0006-0000-0000-0000-000000000001"
+# Twin shells of an active parent: older upgraded keeping the arrow, keeper healed
+mkjob abcd0007 "TwinH1" "abcd0007-0000-0000-0000-000000000001"
+mkjob abcd0008 "TwinH2" "abcd0008-0000-0000-0000-000000000001"
+cat > "$T/.claude/daemon/roster.json" <<EOF2
+{"workers":{
+ "abcd0006":{"pid":99999910,"startedAt":$NOWMS2,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PG"}}},
+ "abcd0007":{"pid":99999911,"startedAt":$NOWMS2,"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PH"}}},
+ "abcd0008":{"pid":99999912,"startedAt":$(( NOWMS2 + 5 )),"dispatch":{"launch":{"mode":"resume","fork":true,"sessionId":"$PH"}}}
+}}
+EOF2
+rm -f "$T/.claude/fork-watch-sweep-stamp"
+run
+echo "arrow fork    (want [←Dup?] FreshForkL): $(jn abcd0006)"
+echo "arrow parent  (want [Old Fork] SoloE, titles stay plain): $(ft "$PG")"
+echo "arrow upgrade (want [←Dup] TwinH1, arrow survives the final verdict): $(jn abcd0007)"
+echo "arrow keeper  (want TwinH2 healed, arrow dropped): $(jn abcd0008)"

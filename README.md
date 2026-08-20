@@ -18,20 +18,23 @@ The three causes of duplicate/ghost rows:
 
 ## What it does
 
-Two hooks plus a shell wrapper. Append/rename only — nothing is ever deleted, wrong marks self-heal on a later run. **A marker means "safe to delete"**; a working non-duplicate session is never marked.
+Two hooks plus a shell wrapper. Append/rename only — nothing is ever deleted, wrong marks self-heal on a later run. **A marker means "safe to delete"** (except the provisional `[Dup?] `); a working non-duplicate session is never marked with a final marker.
 
 | Marker | Meaning |
 |---|---|
 | `[Old Fork] ` | Transcript superseded by a copy holding the same conversation. Heals when the session diverges past the fork. |
+| `[Dup?] ` | PROVISIONAL — probably a duplicate, not yet deletion-verified. Written from roster info alone (a resume-fork spawned after the last completed sweep, parent transcript still present) about 0.3s into the run, before the settle wait, so a fresh fork's row shows its status at once. Job-row name only, never a transcript title. The same run's content sweeps upgrade it to a real verdict or heal it; one that escaped both expires on the next full sweep. Never delete on a `[Dup?] `. |
 | `[Dup] ` | Redundant duplicate: an at-rest twin fork of the same parent, a fork shell whose parent conversation another row already carries, or the cold copy of identical same-title twins. Twin-vs-superseded is judged on conversation entries only — junk that Claude Code also gives uuids to (attachments, system-reminder-only user entries, "No response requested." fillers) never turns a twin into an `[Old Fork] `. |
 | `[Dead] ` | Job row that can never produce a conversation again: no real transcript and no live or respawnable worker. |
 | `[Stub] ` | Transcript with a title but zero messages whose session is unservable — it would open empty. |
+
+A `←` inside a job-row marker (`[←Dup?] `, `[←Dup] `, …) is a best-guess note that the session was minted by backgrounding a live session — the left-press-to-agents-view ghost pattern — rather than by resuming a cold one (judged at provisional time: the parent has a roster entry, or its transcript was written within 5 minutes before the mint; a fork of a session quit moments earlier is mistagged). The tag rides along on marker upgrades, is dropped on heal, never appears on transcript titles, and changes nothing about what the marker means.
 
 On every fork the SessionStart hook also emits a `systemMessage` naming the parent, and renames the parent to `[Old Fork] <title> - forked on <time> by <id>`.
 
 ## Files
 
-- `fork-watch.sh` — SessionStart hook; also runs standalone as `fork-watch.sh --sweep-only`. Fork detection plus four marker sweeps over the jobs registry (`~/.claude/jobs/*/state.json`), all project transcripts and the daemon roster.
+- `fork-watch.sh` — SessionStart hook; also runs standalone as `fork-watch.sh --sweep-only`. Fork detection plus five marker sweeps over the jobs registry (`~/.claude/jobs/*/state.json`), all project transcripts and the daemon roster.
 - `fork-watch-end.sh` — SessionEnd hook; marks a session `[Old Fork] ` when its whole conversation lives on in another transcript.
 - `install.sh` — symlinks both hooks into `~/.claude/scripts` and prints the `settings.json` and `.bashrc` blocks to add.
 - `tests/fwtest.sh` — fixture test: builds a fake `~/.claude` tree and asserts every marker, heal and stability behaviour (idempotent second run).

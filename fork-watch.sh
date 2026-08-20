@@ -11,9 +11,12 @@
 # "[Old Fork] <title> - forked on HH:MM dd.mm.yyyy by <first 4 chars of new
 # session id>"; re-forking never stacks markers or "forked on" suffixes.
 #
-# Markers ("[Old Fork] ", "[Stub] ", "[Dead] ", "[Dup] ") are mutually
-# exclusive states: setting one replaces any other, and a mark that no longer
-# holds is healed off on a later session start.
+# Markers ("[Old Fork] ", "[Stub] ", "[Dead] ", "[Dup] ", "[Dup?] ") are
+# mutually exclusive states: setting one replaces any other, and a mark that
+# no longer holds is healed off on a later session start. "[Dup?] " is the
+# PROVISIONAL dup verdict — written from roster info alone before the settle
+# wait so a fresh fork shows its status at once; unlike the others it does NOT
+# mean "safe to delete", and the same run's content sweeps upgrade or heal it.
 # The hook never deletes anything: the fork copies the conversation in full,
 # but the parent's subagents/ folder is NOT copied, so deletion stays manual.
 
@@ -42,24 +45,34 @@ else
 fi
 
 parse_markers() {
-  # Sets PM_BASE ($1 without any leading markers) and PM_OLDFORK (non-empty
-  # when the stripped markers included "[Old Fork] ").
-  PM_BASE="$1" PM_OLDFORK=
+  # Sets PM_BASE ($1 without any leading markers), PM_OLDFORK (non-empty when
+  # the stripped markers included "[Old Fork] ") and PM_ARROW (non-empty when
+  # any stripped marker carried the "←" left-press tag — a best-guess note
+  # that the session was minted by backgrounding a live session, preserved
+  # across marker upgrades by set_job_marker and dropped on heal).
+  PM_BASE="$1" PM_OLDFORK= PM_ARROW=
   local changed=1
   while [ -n "$changed" ]; do
     changed=
     case "$PM_BASE" in
       "[Old Fork] "*) PM_BASE=${PM_BASE#"[Old Fork] "}; PM_OLDFORK=1; changed=1 ;;
+      "[←Old Fork] "*) PM_BASE=${PM_BASE#"[←Old Fork] "}; PM_OLDFORK=1; PM_ARROW=1; changed=1 ;;
       "[Stub] "*) PM_BASE=${PM_BASE#"[Stub] "}; changed=1 ;;
+      "[←Stub] "*) PM_BASE=${PM_BASE#"[←Stub] "}; PM_ARROW=1; changed=1 ;;
       "[Dead] "*) PM_BASE=${PM_BASE#"[Dead] "}; changed=1 ;;
+      "[←Dead] "*) PM_BASE=${PM_BASE#"[←Dead] "}; PM_ARROW=1; changed=1 ;;
       "[Dup] "*) PM_BASE=${PM_BASE#"[Dup] "}; changed=1 ;;
+      "[←Dup] "*) PM_BASE=${PM_BASE#"[←Dup] "}; PM_ARROW=1; changed=1 ;;
+      "[Dup?] "*) PM_BASE=${PM_BASE#"[Dup?] "}; changed=1 ;;
+      "[←Dup?] "*) PM_BASE=${PM_BASE#"[←Dup?] "}; PM_ARROW=1; changed=1 ;;
     esac
   done
   # A base that is only a bare marker token is inherited marker text, not a
   # real name: Claude Code seeds a new session's ai-title from a marked name,
   # so the marker string itself can end up as the whole title.
   case "$PM_BASE" in
-    "[Old Fork]"|"[Stub]"|"[Dead]"|"[Dup]") PM_BASE= ;;
+    "[Old Fork]"|"[Stub]"|"[Dead]"|"[Dup]"|"[Dup?]") PM_BASE= ;;
+    "[←Old Fork]"|"[←Stub]"|"[←Dead]"|"[←Dup]"|"[←Dup?]") PM_BASE= ;;
   esac
 }
 
@@ -271,7 +284,7 @@ set_job_marker() {
   # $1 = session id, $2 = marker ("" heals). Replaces any existing markers on
   # the job-registry name; no-op when the name already matches. Aborts when
   # the daemon rewrote the file mid-flight, so its newer state is not lost.
-  local short="${1:0:8}" jfile="$HOME/.claude/jobs/${1:0:8}/state.json" jname jnew jtmp m1 m2
+  local short="${1:0:8}" jfile="$HOME/.claude/jobs/${1:0:8}/state.json" jname jnew jtmp m1 m2 mark
   [ -f "$jfile" ] || return 1
   if [ -n "${J_SEEN[$short]}" ]; then
     jname="${J_NAME[$short]}"
@@ -279,10 +292,17 @@ set_job_marker() {
     jname=$(jq -r '.name // empty' "$jfile" 2>/dev/null)
   fi
   parse_markers "$jname"
+  # The "←" left-press tag rides along on marker upgrades: a name already
+  # tagged keeps the tag inside whatever marker replaces the old one; healing
+  # ("" marker) drops it with everything else.
+  mark="$2"
+  if [ -n "$mark" ] && [ -n "$PM_ARROW" ]; then
+    case "$mark" in "[←"*) ;; *) mark="[←${mark#\[}" ;; esac
+  fi
   # A nameless job (failed bg handoff shells have no name) gets its short id
   # as the base, so several marked rows stay tellable apart.
-  [ -z "$PM_BASE" ] && [ -n "$2" ] && PM_BASE="${1:0:8}"
-  jnew="$2$PM_BASE"
+  [ -z "$PM_BASE" ] && [ -n "$mark" ] && PM_BASE="${1:0:8}"
+  jnew="$mark$PM_BASE"
   [ "$jnew" = "$jname" ] && return 0
   m1=$(stat -c '%.Y' "$jfile" 2>/dev/null)
   if [ -n "${J_SEEN[$short]}" ] && [ "$m1" != "${J_MTIMEF[$short]}" ]; then
@@ -290,8 +310,12 @@ set_job_marker() {
     # the file so its newer name is not clobbered by a stale cache entry.
     jname=$(jq -r '.name // empty' "$jfile" 2>/dev/null)
     parse_markers "$jname"
-    [ -z "$PM_BASE" ] && [ -n "$2" ] && PM_BASE="${1:0:8}"
-    jnew="$2$PM_BASE"
+    mark="$2"
+    if [ -n "$mark" ] && [ -n "$PM_ARROW" ]; then
+      case "$mark" in "[←"*) ;; *) mark="[←${mark#\[}" ;; esac
+    fi
+    [ -z "$PM_BASE" ] && [ -n "$mark" ] && PM_BASE="${1:0:8}"
+    jnew="$mark$PM_BASE"
     [ "$jnew" = "$jname" ] && return 0
   fi
   jtmp="$jfile.tmp.$$"
@@ -427,10 +451,16 @@ heal_if_marked() {
   # $1 = transcript path, $2 = session id. Strips any marker from the
   # transcript title and the job-registry name; leaves unmarked names alone.
   case "$(file_title "$1")" in
-    "[Dup] "*|"[Old Fork] "*|"[Stub] "*|"[Dead] "*)
+    "[Dup] "*|"[Dup?] "*|"[Old Fork] "*|"[Stub] "*|"[Dead] "*|"[←Dup] "*|"[←Dup?] "*|"[←Old Fork] "*|"[←Stub] "*|"[←Dead] "*)
       retitle "$1" ""
       set_job_marker "$2" ""
+      return
       ;;
+  esac
+  # A provisional "[Dup?] " lives on the job row only (transcripts are never
+  # retitled provisionally), so a clean title must not keep it alive.
+  case "${J_NAME[${2:0:8}]}" in
+    "[Dup?] "*|"[←Dup?] "*) set_job_marker "$2" "" ;;
   esac
 }
 
@@ -530,17 +560,17 @@ sweep_transcripts() {
         [ "$pmax" -lt "$sm" ] && continue
         title=$(file_title "$f")
         case "$title" in
-          "[Stub] "*)
+          "[Stub] "*|"[←Stub] "*)
             retitle "$f" ""
             set_job_marker "$fid" ""
             ;;
-          "[Old Fork]"|"[Stub]"|"[Dead]"|"[Dup]")
+          "[Old Fork]"|"[Stub]"|"[Dead]"|"[Dup]"|"[Dup?]"|"[←Old Fork]"|"[←Stub]"|"[←Dead]"|"[←Dup]"|"[←Dup?]")
             # The whole title is a bare marker token (inherited marker text on
             # a working session): replace it with the short id so it cannot be
             # mistaken for a sweep mark.
             retitle "$f" ""
             ;;
-          "[Old Fork] "*|"[Dup] "*)
+          "[Old Fork] "*|"[Dup] "*|"[Dup?] "*|"[←Old Fork] "*|"[←Dup] "*|"[←Dup?] "*)
             # Divergence heals are judged in one batched pass after the loop.
             last=$(last_uuid "$f")
             [ -n "$last" ] || continue
@@ -675,9 +705,10 @@ EOF
       *" $short "*) set_job_marker "$short" "[Dup] " ;;
       *)
         case "$jname" in
-          "[Dup] "*)
-            # Heal only at-rest shells; a "[Dup] " job with a real transcript
-            # belongs to sweep_copy_dups.
+          "[Dup] "*|"[Dup?] "*|"[←Dup] "*|"[←Dup?] "*)
+            # Heal only at-rest shells; a marked job with a real transcript
+            # belongs to sweep_copy_dups (or, for "[Dup?] ", to provisional
+            # expiry when the copy sweep reaches no verdict).
             if ! real_transcript_exists "$HOME"/.claude/projects/*/"$short"*.jsonl; then
               set_job_marker "$short" ""
             fi
@@ -828,6 +859,61 @@ sweep_copy_dups() {
   done
 }
 
+sweep_provisional_dups() {
+  # Immediate provisional verdicts, written right after the caches load and
+  # before the settle wait (~0.3s into the run instead of ~5s), so a fresh
+  # fork's row shows its likely status in the agents view at once. Roster only:
+  # a resume-fork spawned AFTER the last completed sweep ($sm) whose parent
+  # transcript still exists is almost certainly a redundant shell -> "[Dup?] ".
+  # The mark is NOT deletion-safe: the same run's content sweeps replace it
+  # with a real verdict or heal it (shell keepers via sweep_dups' heal arm,
+  # materialized keepers via heal_if_marked), and one that escaped both (a
+  # fork that diverged before judgment) expires here on the next full sweep. The after-$sm gate keeps a healed keeper from being
+  # re-marked on every run; the 120s cap bounds the flicker window when a
+  # worker respawn refreshes startedAt.
+  local short jname lsrc fresh ts pshort pmt
+  for short in "${!J_SEEN[@]}"; do
+    jname=${J_NAME[$short]}
+    fresh=
+    if [ "${R_MODE[$short]}" = "resume" ] && [ "${R_FORK[$short]}" = "true" ]; then
+      lsrc=${R_LSRC[$short]}
+      case "$lsrc" in
+        *"/${J_SID[$short]}.jsonl") lsrc= ;;
+      esac
+      ts=${R_TS[$short]:-0}
+      if [ -n "$lsrc" ] && [ -e "$lsrc" ] \
+        && [ "$ts" -gt $((sm * 1000)) ] \
+        && [ $((NOW * 1000 - ts)) -lt 120000 ]; then
+        fresh=1
+      fi
+    fi
+    if [ -n "$fresh" ]; then
+      parse_markers "$jname"
+      # Only unmarked rows: a real verdict ("[Dup] ", "[Old Fork] ", ...) from
+      # an earlier run must never be downgraded to a provisional one.
+      if [ "$PM_BASE" = "$jname" ]; then
+        # "←" left-press best guess: the parent was live around the mint (a
+        # roster entry of its own — presence, not worker_live: a dead-pid
+        # roster row still means recently live — or its transcript written
+        # within 5 min before the mint). The fork backgrounded an ACTIVE
+        # session, the ← ghost pattern, rather than resuming a cold one. A
+        # fork of a session quit moments earlier is mistagged; display-only.
+        pshort=${lsrc##*/}; pshort=${pshort%.jsonl}; pshort=${pshort:0:8}
+        pmt=$(stat -c %Y "$lsrc" 2>/dev/null) || pmt=0
+        if [ -n "${R_PID[$pshort]}" ] || [ "$pmt" -gt $((ts / 1000 - 300)) ]; then
+          set_job_marker "$short" "[←Dup?] "
+        else
+          set_job_marker "$short" "[Dup?] "
+        fi
+      fi
+    else
+      case "$jname" in
+        "[Dup?] "*|"[←Dup?] "*) set_job_marker "$short" "" ;;
+      esac
+    fi
+  done
+}
+
 sweep_dead_jobs() {
   # A jobs-registry row whose session has no transcript in any project and no
   # live daemon worker can never be entered again ("no saved transcript") ->
@@ -852,13 +938,13 @@ sweep_dead_jobs() {
     # iterated — not a prefix of $jsid, which need not match the folder name.
     if real_transcript_exists "$HOME"/.claude/projects/*/"$jsid".jsonl; then
       case "$jname" in
-        "[Dead] "*) set_job_marker "$short" "$healmark" ;;
+        "[Dead] "*|"[←Dead] "*) set_job_marker "$short" "$healmark" ;;
       esac
       continue
     fi
     if job_alive "$jsid"; then
       case "$jname" in
-        "[Dead] "*|"[Stub] "*) set_job_marker "$short" "$healmark" ;;
+        "[Dead] "*|"[Stub] "*|"[←Dead] "*|"[←Stub] "*) set_job_marker "$short" "$healmark" ;;
       esac
       continue
     fi
@@ -933,6 +1019,7 @@ if [ $((NOW - sm)) -lt 30 ] && sweeps_current; then
   [ -n "$sweep_only" ] && exit 0
 else
   load_jobs
+  sweep_provisional_dups
   scan_transcripts
   settle_hot_files
   sweep_transcripts

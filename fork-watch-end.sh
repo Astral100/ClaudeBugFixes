@@ -37,12 +37,19 @@ strip_markers() {
       "[Stub] "*) s=${s#"[Stub] "}; changed=1 ;;
       "[Dead] "*) s=${s#"[Dead] "}; changed=1 ;;
       "[Dup] "*) s=${s#"[Dup] "}; changed=1 ;;
+      "[Dup?] "*) s=${s#"[Dup?] "}; changed=1 ;;
+      "[←Old Fork] "*) s=${s#"[←Old Fork] "}; changed=1 ;;
+      "[←Stub] "*) s=${s#"[←Stub] "}; changed=1 ;;
+      "[←Dead] "*) s=${s#"[←Dead] "}; changed=1 ;;
+      "[←Dup] "*) s=${s#"[←Dup] "}; changed=1 ;;
+      "[←Dup?] "*) s=${s#"[←Dup?] "}; changed=1 ;;
     esac
   done
   # A base that is only a bare marker token is inherited marker text, not a
   # real name — callers already substitute the short id / fallback title.
   case "$s" in
-    "[Old Fork]"|"[Stub]"|"[Dead]"|"[Dup]") s= ;;
+    "[Old Fork]"|"[Stub]"|"[Dead]"|"[Dup]"|"[Dup?]") s= ;;
+    "[←Old Fork]"|"[←Stub]"|"[←Dead]"|"[←Dup]"|"[←Dup?]") s= ;;
   esac
   printf '%s' "$s"
 }
@@ -52,7 +59,13 @@ if [ -f "$jfile" ]; then
   jname=$(jq -r '.name // empty' "$jfile" 2>/dev/null)
   jbase=$(strip_markers "$jname")
   [ -z "$jbase" ] && jbase="${sid:0:8}"
-  jnew="[Old Fork] $jbase"
+  # The "←" left-press tag rides along on marker upgrades (same contract as
+  # fork-watch.sh set_job_marker): a name already tagged keeps the tag inside
+  # the replacement marker.
+  case "$jname" in
+    "[←"*) jnew="[←Old Fork] $jbase" ;;
+    *) jnew="[Old Fork] $jbase" ;;
+  esac
   if [ "$jnew" != "$jname" ]; then
     jtmp="$jfile.tmp.$$"
     m1=$(stat -c '%.Y' "$jfile" 2>/dev/null)
